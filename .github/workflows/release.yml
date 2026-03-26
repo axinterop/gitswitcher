@@ -1,0 +1,117 @@
+name: Release Build
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build - ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_ext: ""
+            use_cross: false
+
+          - name: Linux ARM64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_ext: ""
+            use_cross: true
+
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_ext: ".exe"
+            use_cross: false
+
+          - name: macOS ARM64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary_ext: ""
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install cross
+        if: matrix.platform.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (cross)
+        if: matrix.platform.use_cross
+        run: cross build --release --target ${{ matrix.platform.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.platform.use_cross }}
+        run: cargo build --release --target ${{ matrix.platform.target }}
+
+      - name: Get binary name
+        id: binary_name
+        shell: bash
+        run: |
+          BINARY_NAME=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].targets[] | select(.kind[] | contains("bin")) | .name' \
+            | head -n 1)
+          echo "name=$BINARY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Package binary
+        shell: bash
+        run: |
+          BIN="${{ steps.binary_name.outputs.name }}"
+          TARGET="${{ matrix.platform.target }}"
+          EXT="${{ matrix.platform.binary_ext }}"
+          ARCHIVE="${BIN}-${TARGET}"
+          mkdir -p dist
+          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+            7z a "dist/${ARCHIVE}.zip" "target/${TARGET}/release/${BIN}${EXT}"
+          else
+            tar -czf "dist/${ARCHIVE}.tar.gz" -C "target/${TARGET}/release" "${BIN}${EXT}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.binary_name.outputs.name }}-${{ matrix.platform.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
